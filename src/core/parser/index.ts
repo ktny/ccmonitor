@@ -23,6 +23,8 @@ function getCachedRepositoryName(directory: string): string {
 
   let repoName = getRepositoryName(directory);
 
+  console.log({ repoName });
+
   if (!repoName) {
     // Try to find parent repository
     repoName = findParentRepository(directory);
@@ -71,38 +73,32 @@ function findParentRepository(directory: string): string | null {
 }
 
 export async function loadSessionsInTimeRange(
-  startTime: Date,
-  endTime: Date,
+  startTime?: Date,
+  endTime?: Date,
   projectNames?: string[],
   progressTracker?: ProgressTracker
 ): Promise<SessionTimeline[]> {
   // Clear repository cache at the start of each execution
   clearRepositoryCache();
 
-  const events = await loadEventsFromProjects(
-    { startTime, endTime, projectNames },
-    progressTracker
-  );
+  const filterOptions: FilterOptions = { projectNames };
+  if (startTime && endTime) {
+    filterOptions.startTime = startTime;
+    filterOptions.endTime = endTime;
+  }
+
+  const events = await loadEventsFromProjects(filterOptions, progressTracker);
 
   const grouped = await groupEventsByRepositoryConsolidated(events);
 
-  // Always use consolidated mode - sort by event count
-  return Array.from(grouped.values()).sort((a, b) => b.eventCount - a.eventCount);
+  return Array.from(grouped.values());
 }
 
 export async function loadAllSessions(
   projectNames?: string[],
   progressTracker?: ProgressTracker
 ): Promise<SessionTimeline[]> {
-  // Clear repository cache at the start of each execution
-  clearRepositoryCache();
-
-  const events = await loadEventsFromProjects({ projectNames }, progressTracker);
-
-  const grouped = await groupEventsByRepositoryConsolidated(events);
-
-  // Always use consolidated mode - sort by event count
-  return Array.from(grouped.values()).sort((a, b) => b.eventCount - a.eventCount);
+  return loadSessionsInTimeRange(undefined, undefined, projectNames, progressTracker);
 }
 
 interface FilterOptions {
@@ -121,56 +117,47 @@ async function loadEventsFromProjects(
     join(homedir(), '.config', 'claude', 'projects'),
   ];
 
-  let foundAnyDir = false;
   const allFilePaths: { filePath: string; projectName: string }[] = [];
-
-  // First pass: discover all files
 
   for (const projectsDir of projectsDirs) {
     try {
       const dirStat = await stat(projectsDir);
       if (!dirStat.isDirectory()) continue;
-
-      foundAnyDir = true;
-      const dirs = await readdir(projectsDir);
-
-      for (const dir of dirs) {
-        const dirPath = join(projectsDir, dir);
-        try {
-          const files = await readdir(dirPath);
-
-          // Check if directory has any jsonl files before processing
-          const hasJsonlFiles = files.some(file => file.endsWith('.jsonl'));
-          if (!hasJsonlFiles) {
-            continue;
-          }
-
-          // Early project filtering - check if directory should be processed
-          const repoName = getCachedRepositoryName(dirPath);
-          if (filterOptions?.projectNames?.length) {
-            if (!filterOptions.projectNames.includes(repoName)) {
-              continue; // Skip this entire directory
-            }
-          }
-
-          for (const file of files) {
-            if (file.endsWith('.jsonl')) {
-              const filePath = join(dirPath, file);
-              allFilePaths.push({ filePath, projectName: repoName });
-            }
-          }
-        } catch (error) {
-          // Skip inaccessible directories
-        }
-      }
     } catch (error) {
-      // Directory doesn't exist, try the next one
       continue;
     }
-  }
 
-  if (!foundAnyDir) {
-    throw new Error(`Claude projects directory not found. Checked: ${projectsDirs.join(', ')}`);
+    const dirs = await readdir(projectsDir);
+
+    for (const dir of dirs) {
+      const dirPath = join(projectsDir, dir);
+
+      let dirStats;
+      try {
+        dirStats = await stat(dirPath);
+      } catch (error) {
+        continue;
+      }
+
+      if (!dirStats.isDirectory()) continue;
+
+      const files = await readdir(dirPath);
+
+      // Early project filtering - check if directory should be processed
+      const repoName = getCachedRepositoryName(dirPath);
+      if (filterOptions?.projectNames?.length) {
+        if (!filterOptions.projectNames.includes(repoName)) {
+          continue; // Skip this entire directory
+        }
+      }
+
+      for (const file of files) {
+        if (file.endsWith('.jsonl')) {
+          const filePath = join(dirPath, file);
+          allFilePaths.push({ filePath, projectName: repoName });
+        }
+      }
+    }
   }
 
   // Set total files count
@@ -183,21 +170,9 @@ async function loadEventsFromProjects(
     return parseJSONLFile(filePath, filterOptions, progressTracker);
   });
 
-  // Process all files in parallel and efficiently concatenate results
+  // Process all files in parallel and flatten results
   const allEventArrays = await Promise.all(fileProcessingTasks);
-
-  // Calculate total length for better memory allocation
-  const totalLength = allEventArrays.reduce((sum, events) => sum + events.length, 0);
-  const allEvents: SessionEvent[] = new Array(totalLength);
-
-  let index = 0;
-  for (const events of allEventArrays) {
-    for (const event of events) {
-      allEvents[index++] = event;
-    }
-  }
-
-  return allEvents;
+  return allEventArrays.flat();
 }
 
 async function parseJSONLFile(
